@@ -1,0 +1,1200 @@
+---
+title: "Bulk RNA-Seq Analysis of Hypo- vs. Hypervascular KPCY Clones from Li et al. 2018"
+format: html
+editor: source
+---
+
+```{r setup, results='hide', echo=FALSE, warning=FALSE, message=FALSE, include=TRUE}
+library(knitr)
+library(BiocManager)
+library(tidyverse)
+library(ggplot2)
+library(data.table)
+library(omnideconv)
+library(Seurat)
+library(DESeq2)
+
+knitr::opts_knit$set(root.dir = "/Users/wbs28/OldridgeStangerLabs/00_Projects/PDAC_Hypo_vs_Hypervascular")
+```
+
+
+Li et al. 2018 (https://doi.org/10.1016/j.immuni.2018.06.006) provides a number of different datasets from tumors derived from clonal KPC cell lines that we can use to investigate vascular heterogeneity. 
+
+To start, we will attempt to classify each cell line as driving the formation of either hypovascular, intermediate, or hypervascular tumors. To do so, we can run DWLS deconvolution (https://doi.org/10.1038%2Fs41467-019-10802-z) using the omnideconv package (https://doi.org/10.1101/2024.06.10.598226) and the endothelial index classifier (https://doi.org/10.1172/JCI136655) on bulk RNA-seq data from unsorted tumor samples from these cell lines to estimate the endothelial fraction. Once we have classified our tumors in this way, we can investigate the ATAC and bulk RNA-seq data from sorted tumor samples to investigate tumor cell-intrinsic factors that could be driving vascular heterogeneity.
+
+To perform both the endothelial index scoring and the DWLS deconvolution, we will need a TPM count matrix from the unsorted, bulk RNA-seq data. We can generate this TPM count matrix by running salmon (https://doi.org/10.1038/nmeth.4197) to estimate transcript-level abundance from the raw fastq files and use tximport to extract TPM counts. 
+
+Before doing so, we can prepare the other inputs for the DWLS deconvolution, which are:
+1. The single-cell counts matrix from a downsampled, reference scRNA-seq dataset
+2. The cell type annotations from the reference scRNA-seq dataset 
+3. The information on the individual/experiment from which the cells in the reference scRNA-seq dataset were retrieved (batch ID)
+
+We can prepare each of these inputs one at a time. All three inputs require a reference scRNA-seq atlas of mouse PDAC. The reference atlas will be imported from another project, whereby 13 historical or vehicle control KPC tumors were collected by the Olive Lab (see `~/StangerLab_Rotation/RevMed_RASi/scRNA-Seq/FinalRotationPresentation.pptx` for sample info).
+
+```{r}
+reference <- readRDS("~/StangerLab_Rotation/RevMed_RASi/scRNA-Seq/data/11_FullUMAPObjects/FinalObject_lymphocytesFine.Rds")
+reference <- subset(reference, subset = Condition == "Control")
+as.data.frame(table(reference$CellType_MyeloidFine, dnn = list("CellType_MyeloidFine")), responseName = "number_cells")
+```
+
+```{r}
+reference$CellType_MyeloidFine <- factor(reference$CellType_MyeloidFine, levels = c("Acinar", "B cells", "DCs", 
+                                                                                    "Dendritic cells", "Ductal cells", 
+                                                                                    "Endothelial", "Fibroblasts", 
+                                                                                    "Lymphocytes", "Macrophages", 
+                                                                                    "Neutrophils", "Pericytes", 
+                                                                                    "T & NK cells", "Prolif. Myeloid"))
+reference$CellType_MyeloidFine[reference$CellType_MyeloidFine == "Lymphocytes"] <- "B cells"
+reference$CellType_MyeloidFine[reference$CellType_MyeloidFine == "DCs"] <- "Dendritic cells"
+reference$CellType_MyeloidFine <- factor(reference$CellType_MyeloidFine, levels = c("Acinar", "B cells", "Dendritic cells",
+                                                                                    "Ductal cells", "Endothelial",
+                                                                                    "Fibroblasts", "Macrophages", 
+                                                                                    "Neutrophils", "Pericytes", 
+                                                                                    "Prolif. Myeloid", "T & NK cells"))
+as.data.frame(table(reference$CellType_MyeloidFine, dnn = list("CellType_MyeloidFine")), responseName = "number_cells")
+```
+
+We now need to subsample this reference:
+
+```{r}
+#Take ~10% of each cell type's total count. Min 200 cells per cell type, max 2500 cells per cell type
+celltype_sample_sizes <- c(
+  "Acinar" = 200,
+  "B cells" = 700,
+  "Dendritic cells" = 200,
+  "Ductal cells" = 2500,
+  "Endothelial" = 300,
+  "Fibroblasts" = 1000,
+  "Macrophages" = 1800,
+  "Neutrophils" = 1500,
+  "Perictyes" = 200,
+  "Prolif. Myeloid" = 0,
+  "T & NK cells" = 700
+)
+
+sampled.metadata <- reference@meta.data |>
+  group_by(CellType_MyeloidFine) |>
+  nest() |> mutate(n = map2_dbl(CellType_MyeloidFine, data, ~ min(nrow(.y), celltype_sample_sizes[.x]))) |>
+  ungroup() |> 
+  mutate(samp = map2(data, n, sample_n)) |> 
+  dplyr::select(-data) |>
+  unnest(samp)
+
+reference.sampled <- subset(reference, cells = sampled.metadata$barcode)
+reference.sampled$CellType_MyeloidFine <- factor(reference.sampled$CellType_MyeloidFine, levels = c("Acinar", "B cells",
+                                                                                                    "Dendritic cells",
+                                                                                                    "Ductal cells",
+                                                                                                    "Endothelial", 
+                                                                                                    "Fibroblasts",
+                                                                                                    "Macrophages", 
+                                                                                                    "Neutrophils", 
+                                                                                                    "Pericytes", 
+                                                                                                    "T & NK cells"))
+
+as.data.frame(table(reference.sampled$CellType_MyeloidFine, dnn = list("CellType_MyeloidFine")), responseName = "number_cells")
+
+saveRDS(reference.sampled, file = "data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/04_DWLS_deconvolution/downsampled_reference.RDS")
+```
+
+```{r}
+DimPlot(reference.sampled, reduction = "umap", group.by = "CellType_MyeloidFine")
+```
+
+Our first input is the single-cell counts matrix from this reference scRNA-seq dataset:
+
+```{r}
+counts.matrix <- as.matrix(reference.sampled@assays$RNA$counts)
+
+head(rownames(counts.matrix))
+```
+
+The counts.matrix uses gene names rather than ENSEMBL IDs, so we need to make sure our bulk expression matrix also uses gene names.
+
+Our second input is the cell type annotations from the reference scRNA-seq dataset:
+
+```{r}
+cell.type.annotations <- reference.sampled$CellType_MyeloidFine
+```
+
+Our third input is the batch IDs from the reference scRNA-seq dataset:
+
+```{r}
+batch.ids <- reference.sampled$orig.ident
+```
+
+And our last input is the TPM bulk gene expression matrix. We will run salmon quantification on the HPC and import the results below:
+
+```{r}
+library(AnnotationHub)
+library(ensembldb)
+library(tximport)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+```
+
+
+```{r}
+parent_directory <- "~/OldridgeStangerLabs/00_Projects/PDAC_Hypo_vs_Hypervascular/data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/03_salmonCountMatrices/"
+sample_directories <- list.dirs(parent_directory, recursive = FALSE, full.names = TRUE)
+
+# Initialize an empty vector to store the paths to quant.sf files
+quant_files <- character()
+
+# Loop through each sample subdirectory and collect the quant.sf file paths
+for (sample_directory in sample_directories) {
+  quant_files <- c(quant_files, file.path(sample_directory, "quant.sf"))
+}
+
+# Extract sample names from file paths
+names(quant_files) <- sub(".*/(.*?)_quant/.*", "\\1", quant_files)
+
+# Display the reordered quant_files list
+quant_files
+```
+
+```{r}
+#Load available ensembl transcript annotations to prepare for gene-level quantification
+ah <- AnnotationHub()
+query(ah, "EnsDb.Mmusculus")
+```
+
+
+```{r}
+#Make a tibble with transcript_id and corresponding gene_id to allow for gene-level quantification
+edb <- ah[["AH116340"]]
+txs <- transcripts(edb, return.type = "DataFrame")
+txs_tibble <- as_tibble(txs)
+tx2gene <- dplyr::select(txs_tibble, tx_id_version, gene_id)
+tx2gene
+```
+
+
+```{r}
+txi <- tximport(quant_files, type = "salmon", tx2gene = tx2gene)
+tpm <- txi$abundance
+
+tpm <- as.data.frame(tpm)
+tpm <- rownames_to_column(tpm, var = "row")
+head(tpm)
+```
+
+So we now have a tpm count matrix, but we need the gene names rather than ensembl IDs because the reference scRNA-seq count matrix uses gene names. We can add the gene names to the tpm df:
+
+```{r}
+#Convert ensembl IDs to gene symbols
+ens2symbol <- AnnotationDbi::select(org.Mm.eg.db,
+                                    key=tpm$row, 
+                                    columns="SYMBOL",
+                                    keytype="ENSEMBL")
+ens2symbol <- as_tibble(ens2symbol)
+head(ens2symbol)
+```
+
+```{r}
+tpm_genes <- inner_join(tpm, ens2symbol, by=c("row"="ENSEMBL"))
+
+tpm_genes
+```
+
+First, we can remove rows with no SYMBOL: 
+
+```{r}
+tpm_genes <- tpm_genes |>
+  dplyr::filter(!is.na(SYMBOL))
+```
+
+Then we can check for duplicate gene names:
+
+```{r}
+dup_values <- tpm_genes |>
+  dplyr::count(SYMBOL) |>
+  dplyr::filter(n > 1) |>
+  dplyr::pull(SYMBOL)
+
+duplicated_rows <- tpm_genes |>
+  dplyr::filter(SYMBOL %in% dup_values)
+
+duplicated_rows |>
+  arrange(SYMBOL)
+```
+
+We want to set the `SYMBOL` column as the rownames, but some of the gene names map to multiple ENSEMBL IDs, which means we will run into an error if we try to make the gene names our rownames because you cannot have duplicate rownames. For downstream DE testing we are going to stick with the ENSEMBL IDs, but just for this deconvolution we can combine rows with the same gene name by summing their counts:
+
+```{r}
+bulk.tpm.counts.dups.removed <- tpm_genes |>
+  dplyr::select(-row)
+
+#sum counts for each unique gene name and collapse rows of the same gene name
+bulk.tpm.counts.dups.removed <- bulk.tpm.counts.dups.removed |>
+  dplyr::group_by(SYMBOL) |>
+  dplyr::summarise(across(everything(), sum)) |>
+  column_to_rownames(var = "SYMBOL") |>
+  as.matrix()
+```
+
+Now we can run the DWLS deconvolution, which occurs in two steps. In the first step, the single-cell data is used to build a signature matrix using the omnideconv function `build_model`, whereby DWLS looks for differentially expressed genes that discriminate across cell types using MAST [@Finak2015]. This signature is optimized so that the genes selected maximally discriminate different cell types. To reduce the computational time of MAST, the omnideconv developers introduced a second version of the MAST-based function (`mast_optimized`) that speeds up the process compared to the original implementation:
+
+```{r}
+signature.matrix.dwls <- omnideconv::build_model(single_cell_object = counts.matrix,
+                        cell_type_annotations = cell.type.annotations,
+                        method = 'dwls', 
+                        dwls_method = 'mast_optimized', 
+                        batch_ids = batch.ids)
+```
+
+Then with the signature constructed, we can perform deconvolution:
+
+```{r}
+deconvolution.results.dwls <- deconvolute(bulk_gene_expression = bulk.tpm.counts.dups.removed, 
+                                          method = 'dwls', 
+                                          dwls_submethod = 'DampenedWLS', 
+                                          model = signature.matrix.dwls,
+                                          normalize_results = T)
+```
+
+
+```{r}
+deconvolution.results.dwls <- as.data.frame(deconvolution.results.dwls)
+
+endothelial_percent_vln <- ggplot(deconvolution.results.dwls, aes(x = "", y = Endothelial * 100)) +
+  geom_violin(fill = "white") +
+  geom_boxplot(fill = "gray", width = 0.05) +
+  xlab("") + 
+  ylab("Estimated Endothelial Cell Percentage") +
+  scale_y_continuous(breaks = seq(0, 15, by = 1)) +
+  theme_minimal() +
+  theme(axis.ticks.x = element_blank(), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.y = element_blank())
+
+endothelial_percent_vln
+```
+
+
+```{r}
+deconvolution.results.dwls$cell.line <- c("2699c4", "2699c4", "2699c4", "2699c4", "2838c3", "2838c3", "2838c3", "6419c1",
+                                          "6419c1", "6419c5", "6419c5", "6421c2", "6421c2", "6422c1", "6422c5", "6422c5",
+                                          "6499c3", "6499c3", "6499c4", "6499c4", "6555c3", "6555c3", "6556c3", "6556c3",
+                                          "6556c4", "6556c4", "6620c1", "6620c1", "6694c2", "6694c2", "7160c2", "7160c2",
+                                          "7160c5", "7160c5")
+```
+
+
+```{r}
+deconvolution.results.dwls |>
+  dplyr::select(Endothelial, cell.line, `T & NK cells`) |>
+  group_by(cell.line) |>
+  dplyr::summarise(across(everything(), mean)) |>
+  dplyr::filter(cell.line %in% c("2699c4", "6419c1", "6556c3", "6422c1", "6419c5", "6694c2", "6499c3", 
+                                 "7160c5", "6422c5", "6556c4", "6555c3", "7160c2", "2838c3", "6421c2",
+                                 "6499c4", "6620c1")) |>
+  column_to_rownames(var = "cell.line") |>
+  arrange(desc(Endothelial))
+```
+
+```{r}
+write.csv(deconvolution.results.dwls, 
+          file = "data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/04_DWLS_deconvolution/DWLS_deconvolution_results.csv",
+          row.names = T, col.names = T)
+```
+
+
+Next we can run the endothelial index scoring on our data. To do so, we need a sample_data.csv file in the following format:
+
+gene_names,Angpt2,Cdh5,Esam,Esm1,Erg,Icam2,Tie1
+GSM4153778,11.6627936,7.574327036,9.725281589,7.888517738,9.372130505,7.69417231,11.21008336
+GSM4153779,12.44443671,9.497866406,11.18526661,7.850518607,7.25149758,9.081058762,11.92972628
+GSM4153780,12.39260419,7.516861269,9.644321871,7.599887081,8.89141826,5.610776214,11.34552363
+GSM4153781,11.97339486,8.51061936,10.32245464,7.457715252,7.681007086,7.216987375,
+GSM4153782,12.30601569,9.898122626,11.14612824,8.458641973,8.687287341,8.906697465,11.43711602
+GSM4153783,11.65130849,7.289907788,10.30179196,7.834592484,6.677682913,6.22373856,10.40676537
+GSM4153784,11.66599384,11.00671694,7.530884668,9.489371876,7.360468446,6.176275173,10.19075171
+GSM4153785,12.54977768,10.48514238,12.662005,6.627013701,10.11647378,9.959585933,11.67461051
+GSM4153786,12.40301155,8.818550428,10.35665207,7.110257679,5.608936949,5.245584496,12.35981491
+
+where the first column is the sample name and the following 7 columns are the counts for the 7 EI genes.
+
+```{r}
+EI_table <- tpm_genes |>
+  as.data.frame() |>
+  dplyr::filter(SYMBOL %in% c("Angpt2", "Cdh5", "Esam", "Esm1", "Erg", "Icam2", "Tie1"))
+
+EI_order <- c("Angpt2", "Cdh5", "Esam", "Esm1", "Erg", "Icam2", "Tie1")
+EI_table$SYMBOL <- factor(EI_table$SYMBOL, levels = EI_order)
+
+EI_table <- EI_table |>
+  arrange(SYMBOL)
+
+EI_table <- EI_table |>
+  dplyr::select(-row) |>
+  column_to_rownames(var = "SYMBOL")
+
+EI_table <- as.data.frame(t(EI_table))
+
+EI_table
+```
+
+```{r}
+write.csv(EI_table, 
+          file = "data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/05_calculate_ei_mac/00_input/EI_sample_data.csv",
+          row.names = T, col.names = T)
+```
+
+The written csv file will then be used to run the EI classifier described in: https://doi.org/10.1172%2FJCI136655 and outlined here: https://github.com/faryabib/VMS.
+
+We can now load in the results of the EI score calculation:
+
+```{r}
+EI_table <- read_csv("data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/05_calculate_ei_mac/01_output/ei_output.csv")
+```
+
+```{r}
+EI_table <- EI_table |>
+  dplyr::select(-`...1`)
+
+names(EI_table)[names(EI_table) == "Unnamed: 0"] <- "Sample ID"
+```
+
+```{r}
+EI_table$cell.line <- c("2699c4", "2699c4", "2699c4", "2699c4", "2838c3", "2838c3", "2838c3", "6419c1",
+                        "6419c1", "6419c5", "6419c5", "6421c2", "6421c2", "6422c1", "6422c5", "6422c5",
+                        "6499c3", "6499c3", "6499c4", "6499c4", "6555c3", "6555c3", "6556c3", "6556c3",
+                        "6556c4", "6556c4", "6620c1", "6620c1", "6694c2", "6694c2", "7160c2", "7160c2",
+                        "7160c5", "7160c5")
+```
+
+```{r}
+write.csv(EI_table, 
+          file = "data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/05_calculate_ei_mac/01_output/ei_output_by_cell_line.csv",
+          row.names = T, col.names = T)
+```
+
+
+```{r}
+EI_vln <- ggplot(EI_table, aes(x = "", y = `EI Score`)) +
+  geom_violin(fill = "white") +
+  geom_boxplot(fill = "gray", width = 0.05) +
+  xlab("") + 
+  ylab("EI Score") +
+  theme_minimal() +
+  theme(axis.ticks.x = element_blank(), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.y = element_blank())
+
+EI_vln
+```
+
+
+```{r}
+EI_table <- EI_table |>
+  column_to_rownames(var = "Sample ID")
+```
+
+```{r}
+merged.EI.df <- merge(deconvolution.results.dwls, EI_table, by = "row.names", all = T)
+rownames(merged.EI.df) <- merged.EI.df$Row.names
+merged.EI.df$Row.names <- NULL
+merged.EI.df  <- merged.EI.df |>
+  dplyr::select(`EI Score`, Endothelial, cell.line.x, cell.line.y)
+merged.EI.df
+```
+
+```{r}
+EI.score_endothelium_cor <- cor.test(merged.EI.df$`EI Score`, merged.EI.df$Endothelial, method = "spearman")
+
+EI.score_endothelium_cor_plot <- ggplot(merged.EI.df, aes(x = `EI Score`, y = Endothelial)) +
+  geom_point(color = "black") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "",
+       x = "Endothelial Index Score",
+       y = "Estimated Endothelial Cell Percentage") +
+  annotate("text", x = min(merged.EI.df$`EI Score`), y = max(merged.EI.df$Endothelial),
+             label = paste("Spearman r =", round(EI.score_endothelium_cor$estimate, 4)), 
+             hjust = -2.231, vjust = 1, size = 4, color = "black") +
+  annotate("text", x = min(merged.EI.df$`EI Score`), y = max(merged.EI.df$Endothelial),
+             label = paste("p-value =", round(EI.score_endothelium_cor$p.value, 4)), 
+             hjust = -2.82, vjust = 3, size = 4, color = "black") +
+  theme_classic() 
+
+EI.score_endothelium_cor
+EI.score_endothelium_cor_plot
+```
+
+Unlike our results from the human data, there is no significant correlation between EI score and endothelium % from deconvolution when tested by sample. We can also group by cell line and assess the correlation:
+
+```{r}
+deconvolution.res.cell.line.avg <- deconvolution.results.dwls |>
+  dplyr::select(Endothelial, cell.line) |>
+  group_by(cell.line) |>
+  dplyr::summarise(across(everything(), mean)) |>
+  column_to_rownames(var = "cell.line") |>
+  arrange(desc(Endothelial))
+
+deconvolution.res.cell.line.avg
+```
+
+```{r}
+EI.table.avg <- EI_table |>
+  dplyr::select(`EI Score`, cell.line) |>
+  group_by(cell.line) |>
+  dplyr::summarise(across(everything(), mean)) |>
+  column_to_rownames(var = "cell.line") |>
+  arrange(desc(`EI Score`))
+EI.table.avg
+```
+
+```{r}
+merged.df.cell.line.avg <- merge(deconvolution.res.cell.line.avg, EI.table.avg, by = "row.names", all = T)
+rownames(merged.df.cell.line.avg) <- merged.df.cell.line.avg$Row.names
+merged.df.cell.line.avg$Row.names <- NULL
+merged.df.cell.line.avg
+```
+
+
+```{r}
+EI.score.cell.line_endothelium_cor <- cor.test(merged.df.cell.line.avg$`EI Score`, merged.df.cell.line.avg$Endothelial, method = "spearman")
+
+EI.score.cell.line_endothelium_cor_plot <- ggplot(merged.df.cell.line.avg, aes(x = `EI Score`, y = Endothelial)) +
+  geom_point(color = "black") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "",
+       x = "Endothelial Index Score",
+       y = "Estimated Endothelial Cell Percentage") +
+  annotate("text", x = min(merged.df.cell.line.avg$`EI Score`), y = max(merged.df.cell.line.avg$Endothelial),
+             label = paste("Spearman r =", round(EI.score.cell.line_endothelium_cor$estimate, 4)), 
+             hjust = -2.69, vjust = 1, size = 4, color = "black") +
+  annotate("text", x = min(merged.df.cell.line.avg$`EI Score`), y = max(merged.df.cell.line.avg$Endothelial),
+             label = paste("p-value =", round(EI.score.cell.line_endothelium_cor$p.value, 4)), 
+             hjust = -2.917, vjust = 3, size = 4, color = "black") +
+  theme_classic() 
+
+EI.score.cell.line_endothelium_cor
+EI.score.cell.line_endothelium_cor_plot
+```
+
+Again, there is no positive correlation between EI score and estimated endothelial %, so this will not be very helpful for stratifying hypovascular vs. hypervascular tumors. We can try another way. Namely, we can try stratifying by Pecam1 (CD31) expression. To do so, we will perform DESeq2 normalization and assess Pecam1 expression across cell lines:
+
+For the DESeq2 normalization, we can work with the raw counts provided on GEO at GSE109971.
+
+```{r}
+raw.counts <- read_tsv("data/01_Li_et_al_2018/00_BulkTumors_bulkRNAseq/06_GEOCountMatrix/GSE109971_bulk_Combined.Allcounts.txt.gz")
+```
+
+```{r}
+#Exclude 2 samples that produced sarcoma-like tumors and were removed from Li et al. 2018 analysis
+raw.counts <- raw.counts |>
+  dplyr::select(-c(bulk_6883c1_no1, bulk_6883c4_no1)) |>
+  column_to_rownames("id")
+
+raw.counts_no.symbol <- raw.counts |>
+  dplyr::select(-symbol)
+```
+
+```{r}
+#Create a meta dataframe to place the cell line and hypo vs. hypervascular classifications
+meta <- as.data.frame(t(raw.counts_no.symbol)) |>
+  dplyr::select(ENSMUSG00000090025) |>
+  dplyr::rename(cell.line = ENSMUSG00000090025) |>
+  dplyr::mutate(endothelial.classification=c(rep(0, 35)))
+
+meta$cell.line <- rownames(meta)
+
+meta$cell.line <- gsub("bulk_|_no\\d+", "", meta$cell.line)
+meta$cell.line[meta$cell.line == "2669c4"] <- "2699c4"
+```
+
+```{r}
+#Remove sample unused in Li et al. 2018 
+meta <- meta |>
+  dplyr::filter(!(cell.line == "7062c3"))
+
+#Remove sample unused in Li et al. 2018
+raw.counts_no.symbol <- raw.counts_no.symbol |>
+  dplyr::select(-bulk_7062c3_no2)
+```
+
+
+
+```{r}
+all(rownames(meta) == colnames(raw.counts_no.symbol))
+```
+
+```{r}
+library("DESeq2")
+dds <- DESeqDataSetFromMatrix(countData = raw.counts_no.symbol,
+                              colData = meta,
+                              design = ~ cell.line)
+dds
+```
+
+```{r}
+dds <- estimateSizeFactors(dds)
+normalized_counts <- counts(dds, normalized=TRUE) |>
+  as.data.frame()
+```
+
+Then we can select only Pecam1, which is ENSMUSG00000020717.
+
+```{r}
+pecam1_expression <- normalized_counts |>
+  dplyr::filter(rownames(normalized_counts) == "ENSMUSG00000020717") |>
+  t() |>
+  as.data.frame()
+```
+
+```{r}
+pecam1_expression$cell.line <- gsub("bulk_|_no\\d+", "", rownames(pecam1_expression))
+pecam1_expression$cell.line[pecam1_expression$cell.line == "2669c4"] <- "2699c4"
+
+pecam1_expression
+```
+
+```{r}
+# Calculate the mean and standard deviation for each cell line
+pecam1_summary_df <- pecam1_expression |>
+  group_by(cell.line) |>
+  summarise(mean_value = mean(ENSMUSG00000020717),
+            sd_value = sd(ENSMUSG00000020717))
+```
+
+```{r}
+ggplot(pecam1_summary_df, aes(x = reorder(cell.line, -mean_value), y = mean_value)) +
+  geom_bar(stat = "identity", 
+           aes(fill = ifelse(cell.line %in% c("7160c5", "6499c3", "6422c5", "6419c1"), "red", 
+                             ifelse(cell.line %in% c("6421c2", "2699c4", "6694c2", "6556c3"), "navy", "gray"))), color = "black") +
+  geom_errorbar(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value), width = 0.2) +
+  theme_classic() +
+  labs(x = "", y = "Normalized Counts") +
+  ggtitle("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_identity(guide = "none")
+```
+
+In addition to using the count matrix, we can also use our results from salmon and the tximport package to construct the DESeq2 object for count normalization:
+
+```{r}
+#construct new metadata df
+meta.txi <- meta
+rownames(meta.txi) <- colnames(txi$counts)
+```
+
+
+```{r}
+all(rownames(meta.txi) == colnames(txi$counts))
+```
+
+```{r}
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = meta.txi,
+                                   design = ~ cell.line)
+
+ddsTxi
+```
+
+```{r}
+ddsTxi <- estimateSizeFactors(ddsTxi)
+normalized.counts_txi <- counts(ddsTxi, normalized=TRUE) |>
+  as.data.frame()
+```
+
+Then we can select only Pecam1, which is ENSMUSG00000020717.
+
+```{r}
+pecam1.expression_txi <- normalized.counts_txi |>
+  dplyr::filter(rownames(normalized.counts_txi) == "ENSMUSG00000020717") |>
+  t() |>
+  as.data.frame()
+```
+
+```{r}
+pecam1.expression_txi$cell.line <- meta.txi$cell.line
+pecam1.expression_txi
+```
+
+```{r}
+# Calculate the mean and standard deviation for each cell line
+pecam1.summary.df_txi <- pecam1.expression_txi |>
+  group_by(cell.line) |>
+  summarise(mean_value = mean(ENSMUSG00000020717),
+            sd_value = sd(ENSMUSG00000020717))
+```
+
+```{r}
+ggplot(pecam1.summary.df_txi, aes(x = reorder(cell.line, -mean_value), y = mean_value)) +
+  geom_bar(stat = "identity", 
+           aes(fill = ifelse(cell.line %in% c("7160c5", "6499c3", "7160c2", "6419c1"), "red", 
+                             ifelse(cell.line %in% c("6421c2", "6422c1", "6694c2", "6556c3"), "navy", "gray"))), color = "black") +
+  geom_errorbar(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value), 
+                width = 0.2) +
+  theme_classic() +
+  labs(x = "", y = "Normalized Counts") +
+  ggtitle("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_identity(guide = "none")
+```
+
+These results are generally similar. To stratify based on vascularity, we will rely on in vivo validation. From in vivo work, 7160c5 and 6422c5 were identified as bonified E. High cell lines and 6556c3, 6421c2, 6694c2, and 2699c4 were all identified as bonified E. Low cell lines. These stratifications will be what are used for DE testing.
+
+For DE testing, we want to turn to the sorted cancer cells given the evidence for tumor cell-intrinsic factors driving vascular heterogeneity. We will use salmon for pseudoalignment and then import the raw counts from salmon.
+
+```{r}
+parent_directory <- "~/OldridgeStangerLabs/00_Projects/PDAC_Hypo_vs_Hypervascular/data/01_Li_et_al_2018/01_SortedYFP+TumorCells_bulkRNAseq/03_salmonCountMatrices/"
+sample_directories <- list.dirs(parent_directory, recursive = FALSE, full.names = TRUE)
+
+# Initialize an empty vector to store the paths to quant.sf files
+quant.files_sorted.tumors <- character()
+
+# Loop through each sample subdirectory and collect the quant.sf file paths
+for (sample_directory in sample_directories) {
+  quant.files_sorted.tumors <- c(quant.files_sorted.tumors, file.path(sample_directory, "quant.sf"))
+}
+
+# Extract sample names from file paths
+names(quant.files_sorted.tumors) <- sub(".*/(.*?)_quant/.*", "\\1", quant.files_sorted.tumors)
+
+# Display the reordered quant_files list
+quant.files_sorted.tumors
+```
+
+```{r}
+txi_sorted.tumors <- tximport(quant.files_sorted.tumors, type = "salmon", tx2gene = tx2gene)
+cts_sorted.tumors <- txi_sorted.tumors$counts
+
+head(cts_sorted.tumors)
+```
+
+```{r}
+# Create a sample table with information about EI classifications and cell line
+meta.txi_sorted.tumors <- data.frame(
+  EI.classification = c(rep("Hypovascular", 4), rep("Hypervascular", 2), rep("Hypovascular", 6), rep("Hypervascular", 2)),
+  cell.line = rep(c("6556c3", "6694c2", "7160c5", "2699c4", "2699c4", "6421c2", "6422c5"), each = 2),
+  stringsAsFactors = FALSE
+)
+
+rownames(meta.txi_sorted.tumors) <- colnames(cts_sorted.tumors)
+
+meta.txi_sorted.tumors
+```
+
+```{r}
+all(rownames(meta.txi_sorted.tumors) %in% colnames(cts_sorted.tumors))
+all(rownames(meta.txi_sorted.tumors) == colnames(cts_sorted.tumors))
+```
+
+```{r}
+ddsTxi_sorted.tumors <- DESeqDataSetFromTximport(txi_sorted.tumors, colData = meta.txi_sorted.tumors, design = ~ EI.classification)
+```
+
+```{r}
+#Pre-filtering to keep only rows with at least 10 reads total
+keep <- rowSums(counts(ddsTxi_sorted.tumors)) >= 10
+ddsTxi_sorted.tumors <- ddsTxi_sorted.tumors[keep,]
+
+#Relevel EI.classification to have hypervascular as the reference
+ddsTxi_sorted.tumors$EI.classification <- relevel(ddsTxi_sorted.tumors$EI.classification, ref = "Hypervascular")
+
+#DE analysis
+ddsTxi_sorted.tumors <- DESeq(ddsTxi_sorted.tumors)
+res <- results(ddsTxi_sorted.tumors)
+res.tidy <- results(ddsTxi_sorted.tumors, tidy = T)
+summary(res)
+```
+
+
+```{r}
+sum(res$padj < 0.05, na.rm=TRUE)
+```
+
+```{r}
+sum(res$padj <= 0.1 & (res$log2FoldChange > 0.58 | res$log2FoldChange < -0.58), na.rm = TRUE)
+```
+
+```{r}
+resultsNames(ddsTxi_sorted.tumors)
+```
+
+
+```{r}
+resLFC <- lfcShrink(ddsTxi_sorted.tumors, coef="EI.classification_Hypovascular_vs_Hypervascular", type="apeglm")
+resLFC
+```
+
+```{r}
+plotMA(resLFC, ylim=c(-6,6))
+```
+
+```{r}
+res.tidy <- inner_join(res.tidy, ens2symbol, by=c("row"="ENSEMBL"))
+head(res.tidy)
+```
+
+```{r}
+library(EnhancedVolcano)
+volcano_sorted.tumors <- EnhancedVolcano(res.tidy,
+    lab = res.tidy$SYMBOL,
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = "Hypovascular vs. Hypervascular",
+    pCutoff = 0.1,
+    FCcutoff = 0.58,
+    legendLabels=c('NS', expression('Log'[2]*'FC'), 'adjusted p-value',
+      expression('adjusted p-value & Log'[2]*'FC')),
+    ylab = expression("-Log"[10]*" adjusted P"),
+    legendLabSize = 12,
+    subtitle = "",
+    caption = expression("Log"[2]*"FC cutoff: 0.58"*"; Adjusted p-value cutoff: 0.1"),
+    captionLabSize = 9)
+
+volcano_sorted.tumors
+```
+
+First, we want to check Vegfa expression levels given the finding that Vegfa is higher in hypovascular tumors:
+
+```{r}
+res.tidy |>
+  dplyr::filter(SYMBOL == "Vegfa")
+```
+
+```{r}
+VEGFA <- plotCounts(ddsTxi_sorted.tumors, gene="ENSMUSG00000023951", intgroup="EI.classification", returnData = TRUE)
+
+VEGFA_padj <- res.tidy |>
+  dplyr::filter(SYMBOL == "Vegfa") |>
+  pull(padj)
+
+VEGFA_gg <- ggplot(VEGFA, aes(x=EI.classification, y=count)) + 
+  geom_point(position=position_jitter(w=0.1,h=0), aes(color = EI.classification), size = 3.5) + 
+  labs(title = "Vegfa", 
+       x = "", y = expression("Log"[10]*"(Normalized Count)"), color = "") +
+  scale_color_manual(values = c("Hypovascular" = "darkblue", "Hypervascular" = "red")) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", fatten = 2) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  NoLegend()
+
+VEGFA_gg
+```
+
+So there is no significant difference in Vegfa expression in the sorted tumor cells.
+
+Next, we want to check Vegfr2 (Kdr) expression:
+
+```{r}
+res.tidy |>
+  dplyr::filter(SYMBOL == "Kdr")
+```
+
+```{r}
+VEGFR2 <- plotCounts(ddsTxi_sorted.tumors, gene="ENSMUSG00000062960", intgroup="EI.classification", returnData = TRUE)
+
+VEGFR2_padj <- res.tidy |>
+  dplyr::filter(SYMBOL == "Kdr") |>
+  pull(padj)
+
+VEGFR2_gg <- ggplot(VEGFR2, aes(x=EI.classification, y=count)) + 
+  geom_point(position=position_jitter(w=0.1,h=0), aes(color = EI.classification), size = 3.5) + 
+  labs(title = "Kdr", 
+       x = "", y = expression("Log"[10]*"(Normalized Count)"), color = "") +
+  scale_color_manual(values = c("Hypovascular" = "darkblue", "Hypervascular" = "red")) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", fatten = 2) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  NoLegend()
+
+VEGFR2_gg
+```
+
+So there is also no significant difference in Kdr (VEGFR2) expression in sorted tumor cells.
+
+We can now look at secreted genes that are upregulated in the hypovascular tumors:
+
+```{r}
+res.sig <- res.tidy |>
+  dplyr::filter(padj <= 0.1 & (log2FoldChange > 0.58 | log2FoldChange < -0.58) & !is.na(SYMBOL)) |>
+  arrange(padj) |>
+  dplyr::select(log2FoldChange, pvalue, padj, SYMBOL) |>
+  column_to_rownames(var = "SYMBOL")
+```
+
+
+
+```{r}
+#Download lists of genes associated with the human secretome
+secreted.protein.genes <- read_tsv("data/01_Li_et_al_2018/01_SortedYFP+TumorCells_bulkRNAseq/04_DEanalysis/secreted_proteins.tsv")
+membrane.protein.genes <- read_tsv("data/01_Li_et_al_2018/01_SortedYFP+TumorCells_bulkRNAseq/04_DEanalysis/membrane_proteins.tsv")
+membrane.and.secreted.protein.genes <- read_tsv("data/01_Li_et_al_2018/01_SortedYFP+TumorCells_bulkRNAseq/04_DEanalysis/membrane_and_secreted_proteins.tsv")
+
+secreted.protein.genes <- secreted.protein.genes |>
+  dplyr::select(Gene, Ensembl)
+
+secreted.protein.genes$Localization <- c(rep("secreted", nrow(secreted.protein.genes)))
+
+membrane.protein.genes <- membrane.protein.genes |>
+  dplyr::select(Gene, Ensembl)
+
+membrane.protein.genes$Localization <- c(rep("membrane", nrow(membrane.protein.genes)))
+
+membrane.and.secreted.protein.genes <- membrane.and.secreted.protein.genes |>
+  dplyr::select(Gene, Ensembl)
+
+membrane.and.secreted.protein.genes$Localization <- c(rep("both", nrow(membrane.and.secreted.protein.genes)))
+```
+
+```{r}
+joined.membrane.and.secreted.proteins <- full_join(secreted.protein.genes, membrane.protein.genes) |>
+  full_join(membrane.and.secreted.protein.genes)
+```
+
+```{r}
+nrow(joined.membrane.and.secreted.proteins)
+```
+
+
+```{r}
+#Download mouse orthologs from ensembl to convert human secretome genes to mouse secretome genes
+ortholog.chart <- read_tsv("data/01_Li_et_al_2018/01_SortedYFP+TumorCells_bulkRNAseq/04_DEanalysis/mart_export.txt")
+```
+
+```{r}
+ortholog.chart <- ortholog.chart |>
+  dplyr::rename(Ensembl = `Gene stable ID`)
+```
+
+
+```{r}
+joined.membrane.and.secreted.proteins.mouse <- left_join(joined.membrane.and.secreted.proteins, ortholog.chart, by = "Ensembl")
+```
+
+```{r}
+joined.membrane.and.secreted.proteins.mouse <- joined.membrane.and.secreted.proteins.mouse |>
+  dplyr::filter(!is.na(`Mouse gene name`)) |>
+  dplyr::select(`Mouse gene name`, Localization) |>
+  dplyr::rename(Gene = `Mouse gene name`)
+```
+
+```{r}
+res.sig <- res.sig |>
+  rownames_to_column("Gene")
+```
+
+```{r}
+#Annotate significant genes with localization (secreted, membrane, both, neither (NA))
+res.sig.annotated <- left_join(res.sig, joined.membrane.and.secreted.proteins.mouse, by = "Gene")
+
+res.sig.secreted.membrane <- res.sig.annotated |>
+  dplyr::filter(!is.na(Localization))
+
+res.sig.secreted <- res.sig.annotated |>
+  dplyr::filter(Localization %in% c("secreted", "both"))
+```
+
+Now we can check which of the genes that are significantly upregulated in hypovascular tumor cells encode secreted proteins:
+
+```{r}
+res.sig.secreted |>
+  dplyr::filter(log2FoldChange > 0)
+```
+
+So of the genes that are upregulated in hypovascular tumor cells, only two genes encode secreted proteins. However, both of these genes encode potent anti-angiogenic factors, so this is extremely interesting for downstream follow-up.
+
+We can also check the membrane-associated genes as well:
+
+```{r}
+res.sig.secreted.membrane |>
+  dplyr::filter(log2FoldChange > 0)
+
+secreted.membrane.genes <- res.sig.secreted.membrane |>
+  dplyr::filter(log2FoldChange > 0) |>
+  pull(Gene)
+```
+
+None of these genes are of interest.
+
+Lastly, we can check the rest of the genes that are significantly upregulated in hypovascular tumors:
+
+```{r}
+res.sig |>
+  dplyr::filter(log2FoldChange > 0 & !(Gene %in% secreted.membrane.genes) & padj < 0.05)
+```
+
+None of these genes are of interest.
+
+
+Now we can look at the genes that are upregulated in hypervascular tumors to understand what is driving VEGF-independent angiogenesis:
+
+```{r}
+res.sig.annotated |>
+  dplyr::filter(log2FoldChange < 0)
+```
+
+
+
+#TODO
+
+
+
+
+
+
+Lastly for the sorted tumor cell analysis, we also want to check the expression of specific genes based on the results of the proteome angiogenesis array from the conditioned media. 
+
+First we can check the genes associated with proteins up in hypovascular tumor cell-derived media:
+
+```{r}
+res.tidy |>
+  dplyr::filter(SYMBOL %in% c("Csf2", "Serpine1", "Col18a1"))
+```
+
+None of these genes show any significant upregulation at the gene expression level.
+
+Next we can check the expression of genes associated with proteins up in hypervascular tumor cell-derived media:
+
+```{r}
+res.tidy |>
+  dplyr::filter(SYMBOL %in% c("Ccn1", "Edn1"))
+```
+Neither of these genes show any significant changes across EI status either.
+
+By far the most interesting results from the sorted tumor analysis is the upregulation of Adamts9 and Ism1 in the hypovascular tumors.
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+Now we can move on to DE analysis of the bulk tumors.
+
+```{r}
+meta.txi_ei.strat <- meta.txi |>
+  dplyr::filter(cell.line %in% c("6556c3", "6694c2", "7160c5", "2699c4", "2699c4", "6421c2", "6422c5")) |>
+  dplyr::rename(EI.classification = endothelial.classification)
+
+meta.txi_ei.strat$EI.classification <- c(rep("Hypovascular", 6), rep("Hypervascular", 2), rep("Hypovascular", 4), rep("Hypervascular", 2))
+
+meta.txi_ei.strat
+```
+
+```{r}
+#Keep only the EI stratified samples
+files_to_keep <- rownames(meta.txi_ei.strat)
+
+# Keep specified elements
+quant.files_bulk.tumors_filtered <- quant_files[(names(quant_files) %in% files_to_keep)]
+
+quant.files_bulk.tumors_filtered
+```
+
+
+```{r}
+txi <- tximport(quant.files_bulk.tumors_filtered, type = "salmon", tx2gene = tx2gene)
+```
+
+
+```{r}
+all(rownames(meta.txi_ei.strat) %in% colnames(txi$counts))
+all(rownames(meta.txi_ei.strat) == colnames(txi$counts))
+```
+
+```{r}
+ddsTxi_bulk.tumors <- DESeqDataSetFromTximport(txi, colData = meta.txi_ei.strat, design = ~ EI.classification)
+```
+
+```{r}
+#Pre-filtering to keep only rows with at least 10 reads total
+keep <- rowSums(counts(ddsTxi_bulk.tumors)) >= 10
+ddsTxi_bulk.tumors <- ddsTxi_bulk.tumors[keep,]
+
+#Relevel EI.classification to have hypervascular as the reference
+ddsTxi_bulk.tumors$EI.classification <- relevel(ddsTxi_bulk.tumors$EI.classification, ref = "Hypervascular")
+
+#DE analysis
+ddsTxi_bulk.tumors <- DESeq(ddsTxi_bulk.tumors)
+res_bulk.tumors <- results(ddsTxi_bulk.tumors)
+res.tidy_bulk.tumors <- results(ddsTxi_bulk.tumors, tidy = T)
+summary(res_bulk.tumors)
+```
+
+
+```{r}
+sum(res_bulk.tumors$padj < 0.05, na.rm=TRUE)
+```
+
+```{r}
+sum(res_bulk.tumors$padj <= 0.1 & (res_bulk.tumors$log2FoldChange > 0.59 | res_bulk.tumors$log2FoldChange < -0.59), na.rm = TRUE)
+```
+
+```{r}
+resultsNames(ddsTxi_bulk.tumors)
+```
+
+
+```{r}
+resLFC_bulk.tumors <- lfcShrink(ddsTxi_bulk.tumors, coef="EI.classification_Hypovascular_vs_Hypervascular", type="apeglm")
+resLFC_bulk.tumors
+```
+
+```{r}
+plotMA(resLFC_bulk.tumors, ylim=c(-6,6))
+```
+
+```{r}
+#Add gene names to results
+res.tidy_bulk.tumors <- inner_join(res.tidy_bulk.tumors, ens2symbol, by=c("row"="ENSEMBL"))
+head(res.tidy_bulk.tumors)
+```
+
+```{r}
+volcano_bulk.tumors <- EnhancedVolcano(res.tidy_bulk.tumors,
+    lab = res.tidy_bulk.tumors$SYMBOL,
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = "Hypovascular vs. Hypervascular",
+    pCutoff = 0.1,
+    FCcutoff = 0.58,
+    legendLabels=c('NS', expression('Log'[2]*'FC'), 'adjusted p-value',
+      expression('adjusted p-value & Log'[2]*'FC')),
+    ylab = expression("-Log"[10]*" adjusted P"),
+    legendLabSize = 12,
+    subtitle = "",
+    caption = expression("Log"[2]*"FC cutoff: 0.58"*"; Adjusted p-value cutoff: 0.1"),
+    captionLabSize = 9)
+
+volcano_bulk.tumors
+```
+
+Again, we first want to check if we see an upregulation of Vegfa in hypovascular tumors.
+
+```{r}
+VEGFA_bulk.tumors <- plotCounts(ddsTxi_bulk.tumors, gene="ENSMUSG00000023951", intgroup="EI.classification", returnData = TRUE)
+
+VEGFA_padj_bulk.tumors <- res.tidy_bulk.tumors |>
+  dplyr::filter(SYMBOL == "Vegfa") |>
+  pull(padj)
+
+VEGFA_gg_bulk.tumors <- ggplot(VEGFA_bulk.tumors, aes(x=EI.classification, y=count)) + 
+  geom_point(position=position_jitter(w=0.1,h=0), aes(color = EI.classification), size = 3.5) + 
+  labs(title = "Vegfa", 
+       x = "", y = expression("Log"[10]*"(Normalized Count)"), color = "") +
+  scale_color_manual(values = c("Hypovascular" = "darkblue", "Hypervascular" = "red")) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", fatten = 2) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  NoLegend()
+
+VEGFA_gg_bulk.tumors
+```
+
+There is no significant change in Vegfa expression, which is an unexpected result given that we saw a clear upregulation of Vegfa in hypovascular tumors by staining.
+
+We can again check Vegfr2 (Kdr) expression next:
+
+```{r}
+VEGFR2_bulk.tumors <- plotCounts(ddsTxi_bulk.tumors, gene="ENSMUSG00000062960", intgroup="EI.classification", returnData = TRUE)
+
+VEGFR2_padj_bulk.tumors <- res.tidy_bulk.tumors |>
+  dplyr::filter(SYMBOL == "Kdr") |>
+  pull(padj)
+
+VEGFR2_gg_bulk.tumors <- ggplot(VEGFR2_bulk.tumors, aes(x=EI.classification, y=count)) + 
+  geom_point(position=position_jitter(w=0.1,h=0), aes(color = EI.classification), size = 3.5) + 
+  labs(title = "Kdr", 
+       x = "", y = expression("Log"[10]*"(Normalized Count)"), color = "") +
+  scale_color_manual(values = c("Hypovascular" = "darkblue", "Hypervascular" = "red")) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", fatten = 2) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  NoLegend()
+
+VEGFR2_gg_bulk.tumors
+```
+
+Again, we don't see a significant change in Kdr expression.
+
+Next, we can check if the two genes that encode secreted proteins that we identified as being upregulated in hypovascular tumors in the sorted tumor cells (Adamts9 and Ism1) are also upregulated in the bulk tumors:
+
+```{r}
+res.tidy_bulk.tumors |>
+  dplyr::filter(SYMBOL %in% c("Adamts9", "Ism1"))
+```
+
+While both Adamts9 and Ism1 are also upregulated at the bulk level, we no longer see the statistical significance. This points to it being a tumor cell-intrinsic upregulation.
+
+We can check what secreted genes are upregulated in hypovascular bulk tumor samples:
+
+```{r}
+res.sig_bulk.tumors <- res.tidy_bulk.tumors |>
+  dplyr::filter(padj <= 0.1 & (log2FoldChange > 0.59 | log2FoldChange < -0.59)) |>
+  dplyr::rename(Gene = SYMBOL)
+
+#Annotate significant genes with localization (secreted, membrane, both, neither (NA))
+res.sig.annotated_bulk.tumors <- left_join(res.sig_bulk.tumors, joined.membrane.and.secreted.proteins.mouse, by = "Gene")
+
+res.sig.secreted.membrane_bulk.tumors <- res.sig.annotated_bulk.tumors |>
+  dplyr::filter(!is.na(Localization))
+
+res.sig.secreted_bulk.tumors <- res.sig.annotated_bulk.tumors |>
+  dplyr::filter(Localization %in% c("secreted", "both"))
+```
+
+```{r}
+res.sig.secreted_bulk.tumors |>
+  dplyr::filter(log2FoldChange > 0)
+```
+
+Ptgds negative regulator of angiogenesis, 
+
+
+
+
+Now we can check the genes that encode proteins upregulated in hypovascular tumor cell-derived media from the angiogenesis proteome array:
+
+```{r}
+res.tidy_bulk.tumors |>
+  dplyr::filter(SYMBOL %in% c("Csf2", "Serpine1", "Col18a1", "Mmp3"))
+```
+
+We do not see any significant changes at the gene expression level.
+
+Next we can check the expression of genes associated with proteins up in hypervascular tumor cell-derived media:
+
+```{r}
+res.tidy_bulk.tumors |>
+  dplyr::filter(SYMBOL %in% c("Ccn1", "Edn1"))
+```
+Neither of these genes show any significant changes across EI status either.
+
+
+
+
+
+
+
+
+
+
+What is the correlation between the EI index and the entire transcriptome (those 7 genes and the rest of the genes in the transcriptome?) Remake the correlation plot using Derek's code for the human data.
+
+
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
